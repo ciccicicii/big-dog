@@ -4,7 +4,7 @@
 """
 import math
 from robot_control_cmd_lcmt import robot_control_cmd_lcmt
-
+import time
 class CustomGaits:
     """
     自定义步态类，场景配置机器人参数
@@ -73,7 +73,7 @@ class CustomGaits:
         'stone_path': {
             'mode': 11,
             'gait_id': 26,        # 慢速小跑，更稳定
-            'step_height': [0.08, 0.15],  # 抬腿高度8cm
+            'step_height': [0.15, 0.15],  # 抬腿高度8cm
             'pos_des': [0.0, 0.0, 0.26],  # 降低重心
             'vel_des': [0.45, 0.0, 0.0],  # 慢速前进
         },
@@ -270,7 +270,7 @@ class Dog_movements:
         msg.gait_id = 0
         #msg.life_count += 1  # 指令生效条件：life_count更新（防止重复指令）
         ctrl.Send_cmd(msg)    # 发送指令
-        #ctrl.Wait_finish(12, 0)  # 等待动作执行完成
+        ctrl.Wait_finish(5, 0)  # 等待动作执行完成
     @staticmethod
     def shake_hand(msg,ctrl):
         msg.mode = 62 # Shake hand, based on position interpolation control
