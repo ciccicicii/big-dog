@@ -57,6 +57,18 @@ class COM(Node):
         )
         self.yellow_line = False
         self.yellow_ratio = 0.0
+        #角度控制
+        self.current_yaw = None
+        self.current_roll = 0.0
+        self.current_pitch = 0.0
+        self.yaw_zero = None
+        self.global_yaw = {
+            "front": None,
+            "left": None,
+            "back": None,
+            "right": None,
+        }
+        self.imu_ready = False
         #自恢复
         self.motion_lock = Lock() # 运动控制锁，确保同一时间只有一个赛段在控制机器人
         self.is_recovering = False
@@ -86,6 +98,122 @@ class COM(Node):
         self.yellow_line = msg.data
     def yellow_ratio_callback(self, msg):
         self.yellow_ratio = msg.data
+    def imu_callback(self, msg):
+        # 从IMU消息中提取当前的roll、pitch、yaw和身体高度信息
+        self.roll = msg.orientation.x
+        self.pitch = msg.orientation.y
+        self.current_yaw = msg.orientation.z
+        self.body_height = msg.linear_acceleration.z  # 假设z轴加速度与身体高度相关（需要根据实际情况调整）
+        #quaternion
+        sinr_cosp = 2 * (msg.orientation.w * msg.orientation.z + msg.orientation.x * msg.orientation.y)
+        cosr_cosp = 1 - 2 * (msg.orientation.y * msg.orientation.y + msg.orientation.z * msg.orientation.z)
+        self.current_roll = atan2(sinr_cosp, cosr_cosp)
+        sinp = 2 * (msg.orientation.w * msg.orientation.y - msg.orientation.z * msg.orientation.x)
+        if abs(sinp) >= 1:
+            self.current_pitch = copysign(pi / 2, sinp)  # 使用90度代替超过范围的值
+        else:
+            self.current_pitch = asin(sinp)
+        siny_cosp = 2 * (msg.orientation.w * msg.orientation.x + msg.orientation.y * msg.orientation.z)
+        cosy_cosp = 1 - 2 * (msg.orientation.x * msg.orientation.x + msg.orientation.y * msg.orientation.y)
+        self.current_yaw = atan2(siny_cosp, cosy_cosp)
+        self.imu_ready = True
+    def normalize_angle(self, angle): # 将角度规范化到[-pi, pi]范围内
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+    def angle_diff(self, target, current):  # 计算当前角度与目标角度之间的最短差值，结果在[-pi, pi]范围内  本质工具函数
+        return self.normalize_angle(target - current)
+    def init_global_heading(self):
+        """
+        程序启动后记录初始航向作为全局正前方
+        """
+        self.get_logger().info("等待IMU稳定，记录全局起始方向...")
+        while rclpy.ok() and not self.imu_ready:
+            time.sleep(0.05)
+        # 连续取几次，减小抖动
+        yaw_samples = []
+        for _ in range(20):
+            if self.current_yaw is not None:
+                yaw_samples.append(self.current_yaw)
+            time.sleep(0.02)
+        if len(yaw_samples) == 0:
+            raise RuntimeError("IMU没有可用yaw数据，无法初始化全局方向")
+        # 简单取最后一个，或者可换平均
+        self.yaw_zero = yaw_samples[-1]
+        self.global_yaw["front"] = self.normalize_angle(self.yaw_zero)
+        self.global_yaw["left"]  = self.normalize_angle(self.yaw_zero + math.pi / 2)
+        self.global_yaw["back"]  = self.normalize_angle(self.yaw_zero + math.pi)
+        self.global_yaw["right"] = self.normalize_angle(self.yaw_zero - math.pi / 2)
+
+        self.get_logger().info(
+            f"全局方向初始化完成: "
+            f"front={self.global_yaw['front']:.3f}, "
+            f"left={self.global_yaw['left']:.3f}, "
+            f"back={self.global_yaw['back']:.3f}, "
+            f"right={self.global_yaw['right']:.3f}"
+        )
+    def turn_to_global_direction(self, direction_name):
+        """
+        direction_name: 'front' / 'left' / 'back' / 'right'
+        """
+        if direction_name not in self.global_yaw:
+            self.get_logger().error(f"未知方向: {direction_name}")
+            return False
+        target_yaw = self.global_yaw[direction_name]
+        self.get_logger().info(
+            f"开始转向全局方向 {direction_name}, target={target_yaw:.3f}"
+        )
+        start_time = time.time()
+        while rclpy.ok():
+            if self.current_yaw is None:
+                time.sleep(0.05)
+                continue
+            err = self.angle_diff(target_yaw, self.current_yaw)
+            # 误差足够小，停止
+            if abs(err) < 0.05:   # 大约3度
+                break
+            # 比例控制
+            yaw_speed = 1.0 * err
+            # 限幅
+            if yaw_speed > 0.35:
+                yaw_speed = 0.35
+            elif yaw_speed < -0.35:
+                yaw_speed = -0.35
+            # 防止快到目标时速度太小转不动
+            if 0 < yaw_speed < 0.10:
+                yaw_speed = 0.10
+            elif -0.10 < yaw_speed < 0:
+                yaw_speed = -0.10
+            self.base_move.turn_l(self.msg, self.ctrl, yaw_speed, 0)
+            # 超时保护
+            if time.time() - start_time > 5.0:
+                self.get_logger().warn("转向超时，强制停止")
+                break
+            time.sleep(0.05)
+            # 停止
+            self.base_move.restand_1(self.msg, self.ctrl)
+            time.sleep(0.2)
+            self.get_logger().info(f"已转到全局方向 {direction_name}")
+            return True
+    def turn_90(self,delta_yaw):
+        target_yaw = self.normalize_angle(self.current_yaw + delta_yaw)
+        while rclpy.ok():
+            err = self.angle_diff(target_yaw, self.current_yaw)
+            if abs(err) < 0.05:   # 约3度
+                break
+            # 比例控制
+            yaw_speed = 0.8 * err
+            # 限幅，避免太快
+            if yaw_speed > 0.35:
+                yaw_speed = 0.35
+            elif yaw_speed < 0.12:
+                yaw_speed = 0.12
+            self.base_move.turn_l(self.msg, self.ctrl, yaw_speed, 0)
+            time.sleep(0.05)
+        self.base_move.restand_1(self.msg, self.ctrl)
+        time.sleep(0.2)
     def is_fallen(self):
         if abs(self.roll) > 0.9:
             return True
@@ -121,33 +249,66 @@ class COM(Node):
 
         self.base_move.restand_1(self.msg,self.ctrl) # 预备动作：站立准备
         # 2. 低头
-        self.base_move.head_down(self.msg, self.ctrl)
+        #self.base_move.head_down(self.msg, self.ctrl)
         time.sleep(1)
         self.msg = self.Pose.get_self_gait("stone_path") 
         self.ctrl.Send_cmd(self.msg) # 石板路行走
         print("石板路行走中...")
+        time.sleep(12)  # 等待行走完成（根据实际动作时间调整）
         # 4. 循环检测黄线
-        start_time = time.time()
-        hit_count = 0
-        # 循环检测黄线
-        while time.time() - start_time < 10.0:
-            if self.yellow_line:
-                hit_count += 1
-            else:
-                hit_count = 0
-            # 连续检测到3次再停，防抖
-            if hit_count >= 3:
-                print(f"检测到黄线，yellow_ratio={self.yellow_ratio:.3f}")
-                break
-            time.sleep(0.05)
-        # time.sleep(9)  # 等待5秒完成石板路挑战
+        # start_time = time.time()
+        # hit_count = 0
+        # # 循环检测黄线
+        # while time.time() - start_time < 10.0:
+        #     if self.yellow_line:
+        #         hit_count += 1
+        #     else:
+        #         hit_count = 0
+        #     # 连续检测到3次再停，防抖
+        #     if hit_count >= 3:
+        #         print(f"检测到黄线，yellow_ratio={self.yellow_ratio:.3f}")
+        #         break
+        #     time.sleep(0.05)
+        # # time.sleep(9)  # 等待5秒完成石板路挑战
         self.base_move.restand_1(self.msg,self.ctrl) # 结束动作：站立准备
         print("石板路挑战完成！")
-        self.base_move.turn_l(self.msg,self.ctrl,0.4,0) # 转向准备下一关
+        self.turn_to_global_direction("right") #左转准备下一关
+        #time.sleep(9) # 朝向下一关等待转向完成
+        print("转向完成")
+        self.base_move.walk(self.msg,self.ctrl,0.3,1,0.15,0.26) # 前进准备下一关
+        time.sleep(2) # 等待前进完成
         self.base_move.restand_1(self.msg,self.ctrl)
-        print("转向完成，准备下一关...")
+        self.turn_to_global_direction("front") # 转向准备下一关
+        #time.sleep(6) # 等待转向完成
         return True
     def ball(self):
+        self.base_move.walk(self.msg,self.ctrl,0.3,0,0.15,0.26) # 前进准备下一关
+        time.sleep(10) # 等待前进完成
+        self.base_move.restand_1(self.msg,self.ctrl)
+        self.turn_to_global_direction("right") # 转向第一个球
+        #撞击球
+        self.base_move.walk(self.msg,self.ctrl,0.3,0,0.15,0.26) # 前进准备撞击球
+        time.sleep(2) # 等待前进完成
+        self.base_move.restand_1(self.msg,self.ctrl)
+        self.turn_90(-math.pi/4) # 转向第二个球
+        #time.sleep(3) # 等待转向完成
+        self.base_move.walk(self.msg,self.ctrl,0.3,0,0.15,0.26) # 前进准备撞击球
+        time.sleep(10) 
+        self.base_move.restand_1(self.msg,self.ctrl)
+        self.turn_90(math.pi/4) # 转向准备撞击第三个球
+        #time.sleep(3) # 等待转向完成
+        self.base_move.walk(self.msg,self.ctrl,0.3,0,0.15,0.26) # 前进准备撞击球
+        time.sleep(2)
+        self.base_move.restand_1(self.msg,self.ctrl)
+        self.turn_to_global_direction("front") # 转向准备撞击第四个球
+        #time.sleep(6) # 等待转向完成
+        self.base_move.walk(self.msg,self.ctrl,0.3,0,0.15,0.26) # 前进准备撞击第四个球
+        time.sleep(12) # 等待前进完成
+        self.base_move.restand_1(self.msg,self.ctrl)
+        self.turn_to_global_direction("right") # 转向准备撞击第四个球
+        self.base_move.walk(self.msg,self.ctrl,0.3,0,0.15,0.26) # 撞击第四个球
+        time.sleep(3) # 等待前进完成
+        print("平地速度挑战完成！到达第三关")
         return 0
     def quxian(self):
         return 0
@@ -175,8 +336,10 @@ class COM(Node):
         return use_pose.get_self_gait(pose_name,default_pose)
     
 
-
+    
     def start_competition(self):
+        # 先等IMU并初始化全局方向
+        self.init_global_heading()
         while self.ctrl.runing and not self.all_finish:
             print(f"\n当前赛段: {self.stage}")
 
