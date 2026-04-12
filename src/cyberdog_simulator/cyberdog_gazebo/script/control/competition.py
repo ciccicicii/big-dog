@@ -57,6 +57,15 @@ class COM(Node):
         )
         self.yellow_line = False
         self.yellow_ratio = 0.0
+        #自恢复
+        self.motion_lock = Lock() # 运动控制锁，确保同一时间只有一个赛段在控制机器人
+        self.is_recovering = False
+        self.fall_detected = False
+        self.pause_competition = False
+        self.roll = 0.0  #判断机器人是否侧翻的参数
+        self.pitch = 0.0
+        self.body_height = 0.28 
+
         print("=" * 60)
         print("  比赛主程序")
         print("=" * 60)
@@ -77,6 +86,30 @@ class COM(Node):
         self.yellow_line = msg.data
     def yellow_ratio_callback(self, msg):
         self.yellow_ratio = msg.data
+    def is_fallen(self):
+        if abs(self.roll) > 0.9:
+            return True
+        if abs(self.pitch) > 0.9:
+            return True
+        if self.body_height < 0.12:
+            return True
+        return False
+    def atuto_recover(self):
+        while self.ctrl.running and not self.all_finish:
+            if not self.is_recovering and self.is_fallen():
+                self.get_logger().warn("检测到机器人跌倒，开始自动恢复！")
+                self.is_recovering = True
+                self.pause_competition = True
+                with self.motion_lock:
+                    try:
+                        self.base_move.restand_1(self.msg, self.ctrl) # 预备动作：站立准备
+                        time.sleep(5) # 等待动作完成
+                        self.get_logger().info("自动恢复完成，继续比赛")
+                    except Exception as e:
+                        self.get_logger().error(f"自动恢复失败: {e}")
+                self.is_recovering = False
+                self.pause_competition = False
+
     def Stone(self):
         """第一关：石板路"""
         print("\n=== 第1关：石板路 ===")
@@ -196,9 +229,19 @@ if __name__ == "__main__":
     # 启动比赛主流程线程
     competition_thread = Thread(target=com.start_competition)
     competition_thread.start()
+    #自动恢复线程
+    recover_thread = Thread(target=com.atuto_recover,daemon=True)
+    recover_thread.start()
     # 保持ROS节点运行，直到比赛结束
-    rclpy.spin(com)
-    # 比赛结束后清理资源
-    com.destroy_node()
-    rclspy.shutdown()
+    # rclpy.spin(com)
+    # # 比赛结束后清理资源
+    # com.destroy_node()
+    # rclspy.shutdown()
+    try:
+        rclpy.spin(com)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        com.destroy_node()
+        rclpy.shutdown()
         
