@@ -19,6 +19,7 @@ import math
 from math import atan2, asin, copysign, pi
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy #设置Qos
 from sensor_msgs.msg import Imu
+from sensor_msgs.msg import LaserScan
 class COM(Node):
     def __init__(self):
         super().__init__('competition_Node')
@@ -46,6 +47,21 @@ class COM(Node):
         self.stage_finish = False   # 当前赛段是否完成
         self.all_finish = False     # 整体比赛是否完成
         self.state_name = "Stone"   # 当前状态名字（方便打印/调试）
+        #雷达控制
+        self.lidar_ranges = None
+        self.lidar_angle_min = 0.0
+        self.lidar_angle_increment = 0.0
+        scan_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.lidar_callback,
+            scan_qos
+        )
         #视觉控制
         self.yellow_sub = self.create_subscription( # 订阅A区 视觉功能话题
             Bool,
@@ -110,6 +126,25 @@ class COM(Node):
         print("10. 踢足球")
         print("=" * 60)
         # self.ctrl.run() # 启动控制器（开启LCM通信线程）
+    #a雷达参数回调
+    def lidar_callback(self, msg):
+        self.lidar_ranges = list(msg.ranges)
+        self.lidar_angle_min = msg.angle_min
+        self.lidar_angle_increment = msg.angle_increment
+    def get_lidar_distance_at_angle(self, target_angle, window_deg=5):
+        if self.lidar_ranges is None:
+            return None
+        window = math.radians(window_deg)
+        min_dist = float('inf')
+        for i, r in enumerate(self.lidar_ranges):
+            angle = self.lidar_angle_min + i * self.lidar_angle_increment
+            if abs(self.angle_diff(target_angle, angle)) < window:
+                if math.isfinite(r) and 0.05 < r < min_dist:
+                    min_dist = r
+        if min_dist == float('inf'):
+            return None
+        return min_dist
+
     def yellow_callback(self, msg):
         self.yellow_line = msg.data
     def yellow_ratio_callback(self, msg):
@@ -234,12 +269,12 @@ class COM(Node):
             # 比例控制s
             yaw_speed = 0.9 * err
             # 限幅，避免太快
-            if yaw_speed > 0.5:
-                yaw_speed = 0.5
+            if yaw_speed > 0.6:
+                yaw_speed = 0.6
             elif 0<yaw_speed < 0.05:
                 yaw_speed = 0.05
-            if yaw_speed <-0.5:
-                yaw_speed = -0.5
+            if yaw_speed <-0.6:
+                yaw_speed = -0.6
             elif 0>yaw_speed >-0.05:
                 yaw_speed = -0.05
             self.get_logger().info(f"yaw={yaw_speed:.3f}")
@@ -277,8 +312,6 @@ class COM(Node):
         # self.msg.mode = 12 # Recovery stand
         # self.msg.gait_id = 0
         # self.ctrl.Send_cmd(self.msg)    # 发送指令
-
-
         self.base_move.restand_1(self.msg,self.ctrl) # 预备动作：站立准备
         #self.turn_relative(-math.pi/4)
         # 2. 低头
@@ -287,7 +320,23 @@ class COM(Node):
         self.msg = self.Pose.get_self_gait("stone_path") 
         self.ctrl.Send_cmd(self.msg) # 石板路行走
         print("石板路行走中...")
-        time.sleep(11.5)  # 等待行走完成（根据实际动作时间调整）
+        time.sleep(11)  # 等待行走完成（根据实际动作时间调整）
+        #转向，头朝前
+        self.turn_to_global_direction("back")
+        self.base_move.walk(self.msg, self.ctrl, 0.15, 1, 0.15, 0.26)
+        start_time = time.time()
+        while time.time() - start_time < 8.0:
+            left_dist = self.get_lidar_distance_at_angle(math.pi / 2, window_deg=6)
+            if left_dist is None:
+                time.sleep(0.05)
+                continue
+            self.get_logger().info(f"left lidar dist={left_dist:.3f}")
+            if 0.25 < left_dist < 1.2:
+                self.get_logger().info("检测到小球位于机器狗左侧，第一关闭环完成")
+                time.sleep(1)
+                break
+            time.sleep(0.05)
+        self.base_move.restand_1(self.msg,self.ctrl) # 结束动作：站立准备
         # 4. 循环检测黄线
         # start_time = time.time()
         # hit_count = 0
@@ -303,20 +352,19 @@ class COM(Node):
         #         break
         #     time.sleep(0.05)
         # # time.sleep(9)  # 等待5秒完成石板路挑战
-        self.base_move.restand_1(self.msg,self.ctrl) # 结束动作：站立准备
         print("石板路挑战完成！")
         self.turn_to_global_direction("right") #左转准备下一关
         #time.sleep(9) # 朝向下一关等待转向完成
         print("转向完成")
         self.base_move.walk(self.msg,self.ctrl,0.3,1,0.15,0.26) # 前进准备下一关
-        time.sleep(4.2) # 等待前进完成
+        time.sleep(4.5) # 等待前进完成
         self.base_move.restand_1(self.msg,self.ctrl)
         self.turn_to_global_direction("front") # 转向准备下一关
         #time.sleep(6) # 等待转向完成
         return True
     def ball(self):
         self.base_move.walk(self.msg,self.ctrl,0.3,1,0.15,0.26) # 前进准备下一关
-        time.sleep(11) # 等待前进完成
+        time.sleep(11.4) # 等待前进完成
         self.base_move.restand_1(self.msg,self.ctrl)
         self.turn_to_global_direction("right") # 转向第一个球
         #撞击球
@@ -327,18 +375,18 @@ class COM(Node):
         self.turn_relative(-4*math.pi/12) # 转向第二个球
         #time.sleep(3) # 等待转向完成
         self.base_move.walk(self.msg,self.ctrl,0.5,1,0.15,0.26) # 前进准备撞击球
-        time.sleep(8.2) 
+        time.sleep(9) 
         self.base_move.restand_1(self.msg,self.ctrl)
         self.turn_to_global_direction("right") # 转向准备撞击第三个球
         #time.sleep(3) # 等待转向完成
         self.base_move.walk(self.msg,self.ctrl,0.5,1,0.15,0.26) # 前进准备撞击球
         print("撞击第2个球")
-        time.sleep(2.5)
+        time.sleep(2.7)
         self.base_move.restand_1(self.msg,self.ctrl)
         self.turn_to_global_direction("front") # 转向准备撞击第四个球
         #time.sleep(6) # 等待转向完成
         self.base_move.walk(self.msg,self.ctrl,0.3,1,0.15,0.26) # 前进准备撞击第四个球
-        time.sleep(16.5) # 等待前进完成
+        time.sleep(17) # 等待前进完成
         self.base_move.restand_1(self.msg,self.ctrl)
         self.turn_to_global_direction("right") # 转向准备撞击第四个球
         self.base_move.walk(self.msg,self.ctrl,0.5,1,0.15,0.26) # 撞击第四个球
